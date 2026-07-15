@@ -49,4 +49,5 @@ Build the private Linux helper and run the complete test suite:
 Applications which vendor this system should run =scripts/build-helper= during
 their build and ship =build/cl-exec-sandbox-helper= beside the Lisp sources.
 Set =CL_EXEC_SANDBOX_HELPER= to an alternate absolute helper path when the
-installed layout differs.
+installed layout differs. Packaged Bubblewrap installations outside =/usr/bin=
+and =/bin= can set =CL_EXEC_SANDBOX_BWRAP= to its absolute executable path.

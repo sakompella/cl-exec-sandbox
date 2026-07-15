@@ -51,6 +51,26 @@
                  "Linux capability discovery finds bubblewrap"))
   nil)
 
+(defun test-bwrap-override ()
+  "Test an explicit absolute Bubblewrap path supports packaged installations."
+  (let* ((expected (or (probe-file #P"/usr/bin/bwrap")
+                       (probe-file #P"/bin/bwrap")))
+         (previous (uiop:getenv "CL_EXEC_SANDBOX_BWRAP")))
+    (when expected
+      (unwind-protect
+           (progn
+             (sb-posix:setenv "CL_EXEC_SANDBOX_BWRAP"
+                              (uiop:native-namestring expected)
+                              1)
+             (test-assert
+              (equal (truename expected)
+                     (cl-exec-sandbox::linux--find-bwrap))
+              "an explicit absolute Bubblewrap path is honored"))
+        (if previous
+            (sb-posix:setenv "CL_EXEC_SANDBOX_BWRAP" previous 1)
+            (sb-posix:unsetenv "CL_EXEC_SANDBOX_BWRAP")))))
+  nil)
+
 (defun test-read-only-enforcement ()
   "Test a read-only policy permits reads and rejects host writes."
   (let* ((root (tests--temporary-root))
@@ -341,6 +361,7 @@
   "Run all cl-exec-sandbox tests and return true."
   (setf *test-count* 0)
   (test-policy-validation)
+  (test-bwrap-override)
   (test-read-only-enforcement)
   (test-workspace-write-enforcement)
   (test-missing-protected-metadata)

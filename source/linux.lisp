@@ -50,10 +50,15 @@
                    (uiop:ensure-absolute-pathname entry (uiop:getcwd)))))
 
 (defun linux--find-bwrap ()
-  "Return a trusted system bubblewrap pathname, excluding the current directory."
-  (loop for candidate in '(#P"/usr/bin/bwrap" #P"/bin/bwrap")
-        when (linux--executable-file-p candidate)
-          return (truename candidate)))
+  "Return the configured or trusted system Bubblewrap pathname."
+  (let ((override (uiop:getenv "CL_EXEC_SANDBOX_BWRAP")))
+    (or (when (and override
+                   (uiop:absolute-pathname-p (pathname override))
+                   (linux--executable-file-p (pathname override)))
+          (truename override))
+        (loop for candidate in '(#P"/usr/bin/bwrap" #P"/bin/bwrap")
+              when (linux--executable-file-p candidate)
+                return (truename candidate)))))
 
 (defun linux--find-rg ()
   "Return the configured or PATH-resolved ripgrep pathname, excluding CWD."
