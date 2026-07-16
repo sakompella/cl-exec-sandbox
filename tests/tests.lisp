@@ -23,6 +23,10 @@
     (ensure-directories-exist root)
     root))
 
+(defun tests--darwin-p ()
+  "Return true when the test process is running on Darwin."
+  (member :darwin *features*))
+
 (defun tests--write (path text)
   "Write TEXT to PATH and return PATH."
   (ensure-directories-exist path)
@@ -51,7 +55,56 @@
          t))
      "glob rules reject positive access")
     (test-assert (getf (sandbox-capabilities) :filesystem-read-write-deny)
-                 "the active backend reports filesystem enforcement"))
+                 "the active backend reports filesystem enforcement")
+    (when (tests--darwin-p)
+      (test-assert (not (sandbox-supported-p :network-proxy-only))
+                   "Darwin reports proxy-only networking as unsupported")
+      (test-assert (eq (getf (sandbox-capabilities) :backend) :seatbelt)
+                   "Darwin reports the Seatbelt backend")))
+  nil)
+
+(defun test-darwin-profile-filters ()
+  "Test Darwin uses filtered allows rather than overriding deny forms."
+  (when (tests--darwin-p)
+    (let* ((root (tests--temporary-root))
+           (blocked (merge-pathnames "blocked/" root))
+           (policy
+             (make-sandbox-policy
+              :workspace-roots (list root)
+              :mount-proc-p nil
+              :isolate-processes-p nil
+              :filesystem-rules
+              (list
+               (make-filesystem-rule :kind :special :path :root :access :read)
+               (make-filesystem-rule :kind :path :path root :access :write)
+               (make-filesystem-rule :kind :path :path blocked :access :deny)))))
+      (unwind-protect
+           (let ((profile (cl-exec-sandbox::darwin--profile policy root)))
+             (test-assert (search "(require-all" profile)
+                          "Seatbelt composes filtered access requirements")
+             (test-assert (search "(require-not (literal" profile)
+                          "Seatbelt excludes the denied path itself")
+             (test-assert (search "(require-not (subpath" profile)
+                          "Seatbelt excludes the denied path subtree")
+             (test-assert (search "(require-not (regex \"" profile)
+                          "Seatbelt protects metadata with a regex")
+             (test-assert (not (search "(deny file-write" profile))
+                          "Seatbelt does not rely on later write denies")
+        (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+  nil))
+
+(defun test-darwin-default-policy-rejection ()
+  "Test Darwin rejects a generic policy asking for Linux-only capabilities."
+  (when (tests--darwin-p)
+    (test-assert
+     (handler-case
+         (progn
+           (sandbox-build-plan "/bin/true" nil
+                               :policy (make-sandbox-policy))
+           nil)
+       (sandbox-unavailable (condition)
+         (eq (sandbox-unavailable-capability condition) :mount-proc)))
+     "Darwin rejects the generic Linux process-isolation defaults"))
   nil)
 
 (defun test-bwrap-override ()
@@ -165,35 +218,72 @@
   (let* ((root (tests--temporary-root))
          (blocked (merge-pathnames "blocked/" root))
          (allowed (merge-pathnames "allowed/" blocked))
+         (readable (merge-pathnames "readable/" blocked))
          (secret (tests--write (merge-pathnames "secret.txt" blocked) "secret"))
+         (readable-secret
+           (tests--write (merge-pathnames "value.txt" readable) "visible"))
          (output (merge-pathnames "new.txt" allowed)))
     (ensure-directories-exist output)
     (let ((policy
             (make-sandbox-policy
              :workspace-roots (list root)
+             :mount-proc-p (not (tests--darwin-p))
+             :isolate-processes-p (not (tests--darwin-p))
              :filesystem-rules
              (list
               (make-filesystem-rule :kind :special :path :root :access :read)
               (make-filesystem-rule :kind :path :path root :access :write)
               (make-filesystem-rule :kind :path :path blocked :access :deny)
+              (make-filesystem-rule :kind :path :path readable :access :read)
               (make-filesystem-rule :kind :path :path allowed :access :write)))))
       (unwind-protect
            (let ((result
                    (run-sandboxed
                     "/bin/sh"
                     (list "-c"
-                          (format nil "cat ~A 2>/dev/null || true; printf ok > ~A"
+                          (format nil "cat ~A 2>/dev/null || true; cat ~A; printf ok > ~A"
                                   (uiop:escape-shell-token
                                    (uiop:native-namestring secret))
+                                  (uiop:escape-shell-token
+                                   (uiop:native-namestring readable-secret))
                                   (uiop:escape-shell-token
                                    (uiop:native-namestring output))))
                     :policy policy
                     :working-directory root)))
              (test-assert (not (search "secret" (sandbox-result-output result)))
                           "an exact deny masks readable content")
+             (test-assert (search "visible" (sandbox-result-output result))
+                          "a narrower read rule reopens a denied parent")
              (test-assert (string= (uiop:read-file-string output) "ok")
                           "a narrower write rule reopens a denied parent"))
         (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+  nil)
+
+(defun test-quoted-workspace-path ()
+  "Test SBPL and shell quoting for workspace paths with spaces and quotes."
+  (let* ((base (tests--temporary-root))
+         (root (merge-pathnames "workspace with \"quotes\"/" base))
+         (file (merge-pathnames "value with spaces.txt" root))
+         (policy (workspace-write-sandbox-policy
+                  :workspace-roots (list root)
+                  :write-tmpdir-p nil
+                  :write-slash-tmp-p nil)))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (let ((result
+                 (run-sandboxed
+                  "/bin/sh"
+                  (list "-c"
+                        (format nil "printf ok > ~A"
+                                (uiop:escape-shell-token
+                                 (uiop:native-namestring file))))
+                  :policy policy
+                  :working-directory root)))
+           (test-assert (zerop (sandbox-result-exit-code result))
+                        "quoted workspace paths launch successfully")
+           (test-assert (string= (uiop:read-file-string file) "ok")
+                        "quoted workspace paths remain writable"))
+      (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore)))
   nil)
 
 (defun test-deny-glob ()
@@ -204,6 +294,8 @@
          (policy
            (make-sandbox-policy
             :workspace-roots (list root)
+            :mount-proc-p (not (tests--darwin-p))
+            :isolate-processes-p (not (tests--darwin-p))
             :filesystem-rules
             (list
              (make-filesystem-rule :kind :special :path :root :access :read)
@@ -224,6 +316,73 @@
            (test-assert (string= (sandbox-result-output result) "public")
                         "deny glob hides only matching content"))
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))
+  nil)
+
+(defun test-direct-full-access ()
+  "Test unrestricted enabled networking keeps the direct launch path."
+  (let* ((root (tests--temporary-root))
+         (file (merge-pathnames "direct.txt" root))
+         (policy (unrestricted-sandbox-policy))
+         (plan (sandbox-build-plan "/bin/true" nil :policy policy))
+         (result
+           (run-sandboxed
+            "/bin/sh"
+            (list "-c"
+                  (format nil "printf ok > ~A"
+                          (uiop:escape-shell-token
+                           (uiop:native-namestring file))))
+            :policy policy
+            :working-directory root)))
+    (unwind-protect
+         (progn
+           (test-assert (string= (uiop:native-namestring
+                                  (sandbox-plan-program plan))
+                                 "/bin/true")
+                        "full access uses the requested program directly")
+           (test-assert (null (sandbox-plan-cleanup-paths plan))
+                        "full access creates no transient sandbox files")
+           (test-assert (zerop (sandbox-result-exit-code result))
+                        "full access command succeeds")
+           (test-assert (string= (uiop:read-file-string file) "ok")
+                        "full access command can write anywhere"))
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))
+  nil)
+
+(defun test-network-profile-modes ()
+  "Test enabled networking is allowed and isolated networking is default-denied."
+  (when (tests--darwin-p)
+    (let ((enabled (cl-exec-sandbox::darwin--profile
+                    (read-only-sandbox-policy :network :enabled)
+                    (uiop:getcwd)))
+          (isolated (cl-exec-sandbox::darwin--profile
+                     (read-only-sandbox-policy :network :isolated)
+                     (uiop:getcwd))))
+      (test-assert (search "(allow network*)" enabled)
+                   "Seatbelt allows enabled networking")
+      (test-assert (not (search "(allow network*)" isolated))
+                   "Seatbelt leaves isolated networking default-denied")))
+  nil)
+
+(defun test-enabled-network ()
+  "Test enabled networking can reach a local listener under Seatbelt."
+  (when (tests--darwin-p)
+    (multiple-value-bind (server thread port)
+        (tests--start-proxy-server)
+      (unwind-protect
+           (let ((result
+                   (run-sandboxed
+                    "/bin/bash"
+                    '("-c"
+                      "exec 3<>/dev/tcp/127.0.0.1/$PORT; IFS= read -r -n 4 reply <&3; printf %s \"$reply\"")
+                    :policy (read-only-sandbox-policy :network :enabled)
+                    :environment (list (format nil "PORT=~D" port))
+                    :timeout 3)))
+             (test-assert (zerop (sandbox-result-exit-code result))
+                          "enabled networking reaches a local listener")
+             (test-assert (string= (sandbox-result-output result) "pong")
+                          "enabled networking carries local socket data"))
+        (sb-bsd-sockets:socket-close server)
+        (sb-thread:join-thread thread :default nil))))
   nil)
 
 (defun test-unrestricted-filesystem-with-isolated-network ()
@@ -262,7 +421,7 @@
                    (format nil "~A|present"
                            (string-right-trim
                             "/"
-                            (uiop:native-namestring root))))
+                            (uiop:native-namestring (truename root)))))
           "direct execution applies working directory and environment")
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))
   nil)
@@ -294,7 +453,7 @@
   nil)
 
 (defun test-isolated-network-seccomp ()
-  "Test restricted networking denies Internet socket creation with seccomp."
+  "Test restricted networking denies Internet socket creation."
   (let ((result
           (run-sandboxed
            "/bin/bash"
@@ -302,10 +461,11 @@
            :policy (read-only-sandbox-policy))))
     (test-assert (not (zerop (sandbox-result-exit-code result)))
                  "isolated networking rejects an Internet socket")
-    (test-assert (search "Operation not permitted"
-                         (sandbox-result-error-output result)
-                         :test #'char-equal)
-                 "isolated networking reports a seccomp denial"))
+    (when (not (tests--darwin-p))
+      (test-assert (search "Operation not permitted"
+                           (sandbox-result-error-output result)
+                           :test #'char-equal)
+                   "isolated networking reports a seccomp denial")))
   nil)
 
 (defun tests--start-proxy-server ()
@@ -338,43 +498,61 @@
         :name "cl-exec-sandbox proxy test server")
        port))))
 
-(defun test-managed-proxy-network ()
-  "Test proxy-only networking reaches a loopback proxy and rewrites its URL."
-  (multiple-value-bind (server thread port)
-      (tests--start-proxy-server)
-    (unwind-protect
-         (let ((result
-                 (run-sandboxed
-                  "/bin/bash"
-                  '("-c"
-                    "port=${HTTP_PROXY##*:}; exec 3<>/dev/tcp/127.0.0.1/$port; IFS= read -r -n 4 reply <&3; printf %s \"$reply\"")
-                  :policy (read-only-sandbox-policy :network :proxy-only)
-                  :environment
-                  (list (format nil "HTTP_PROXY=http://127.0.0.1:~D" port))
-                  :timeout 3)))
-           (test-assert (zerop (sandbox-result-exit-code result))
-                        "proxy-only command completes through the managed bridge")
-           (test-assert (string= (sandbox-result-output result) "pong")
-                        "managed proxy bridge carries bidirectional bytes"))
-      (sb-bsd-sockets:socket-close server)
-      (sb-thread:join-thread thread :default nil)))
+(defun test-proxy-only-network ()
+  "Test proxy-only networking or its explicit Darwin rejection."
+  (if (tests--darwin-p)
+      (test-assert
+       (handler-case
+           (progn
+             (sandbox-build-plan "/bin/sh" '("-c" "true")
+                                 :policy (read-only-sandbox-policy
+                                          :network :proxy-only))
+             nil)
+         (sandbox-unavailable (condition)
+           (eq (sandbox-unavailable-capability condition)
+               :network-proxy-only)))
+       "Darwin reports proxy-only networking as unsupported")
+      (multiple-value-bind (server thread port)
+          (tests--start-proxy-server)
+        (unwind-protect
+             (let ((result
+                     (run-sandboxed
+                      "/bin/bash"
+                      '("-c"
+                        "port=${HTTP_PROXY##*:}; exec 3<>/dev/tcp/127.0.0.1/$port; IFS= read -r -n 4 reply <&3; printf %s \"$reply\"")
+                      :policy (read-only-sandbox-policy :network :proxy-only)
+                      :environment
+                      (list (format nil "HTTP_PROXY=http://127.0.0.1:~D" port))
+                      :timeout 3)))
+               (test-assert (zerop (sandbox-result-exit-code result))
+                            "proxy-only command completes through the managed bridge")
+               (test-assert (string= (sandbox-result-output result) "pong")
+                            "managed proxy bridge carries bidirectional bytes"))
+          (sb-bsd-sockets:socket-close server)
+          (sb-thread:join-thread thread :default nil))))
   nil)
 
 (defun run-tests ()
   "Run all cl-exec-sandbox tests and return true."
   (setf *test-count* 0)
   (test-policy-validation)
+  (test-darwin-profile-filters)
+  (test-darwin-default-policy-rejection)
   (test-bwrap-override)
   (test-read-only-enforcement)
   (test-workspace-write-enforcement)
   (test-missing-protected-metadata)
   (test-deny-and-nested-override)
+  (test-quoted-workspace-path)
   (test-deny-glob)
+  (test-direct-full-access)
+  (test-network-profile-modes)
+  (test-enabled-network)
   (test-unrestricted-filesystem-with-isolated-network)
   (test-external-execution-context)
   (test-timeout)
   (test-merged-output)
   (test-isolated-network-seccomp)
-  (test-managed-proxy-network)
+  (test-proxy-only-network)
   (format t "~&~D cl-exec-sandbox tests passed.~%" *test-count*)
   t)
