@@ -89,23 +89,23 @@
 
 (defun sandbox-capabilities ()
   "Return a portable plist describing the current host sandbox backend."
-  (let ((bwrap (and (member :linux *features*) (linux--find-bwrap)))
+  (let ((linux-p (member :linux *features*))
+        (darwin-p (member :darwin *features*))
+        (bwrap (and (member :linux *features*) (linux--find-bwrap)))
         (rg (and (member :linux *features*) (linux--find-rg)))
         (helper (and (member :linux *features*) (linux--find-helper))))
-    (list :platform (cond
-                      ((member :linux *features*) :linux)
-                      ((member :darwin *features*) :macos)
-                      ((member :windows *features*) :windows)
-                      (t :unknown))
-          :backend (and bwrap :bubblewrap)
-          :available-p (not (null bwrap))
-          :filesystem-read-write-deny (not (null bwrap))
-          :filesystem-deny-globs (and (not (null bwrap)) (not (null rg)))
-          :nested-overrides (not (null bwrap))
+    (list :platform (cond (linux-p :linux) (darwin-p :macos)
+                          ((member :windows *features*) :windows) (t :unknown))
+          :backend (cond (bwrap :bubblewrap) (darwin-p :seatbelt))
+          :available-p (or (not (null bwrap))
+                           (and darwin-p (probe-file #P"/usr/bin/sandbox-exec")))
+          :filesystem-read-write-deny (or bwrap darwin-p)
+          :filesystem-deny-globs (or (and bwrap rg) darwin-p)
+          :nested-overrides (or bwrap darwin-p)
           :process-namespaces (not (null bwrap))
           :network-enabled t
-          :network-isolated (and (not (null bwrap)) (not (null helper)))
-          :network-proxy-only (and (not (null bwrap)) (not (null helper)))
+          :network-isolated (or (and bwrap helper) darwin-p)
+          :network-proxy-only (and bwrap helper)
           :seccomp (not (null helper)))))
 
 (defun sandbox-supported-p (&optional (capability :available-p))
@@ -594,6 +594,9 @@
       ((member :linux *features*)
        (linux--bubblewrap-plan program-path arguments policy cwd
                                environment clear-environment-p))
+      ((member :darwin *features*)
+       (darwin--seatbelt-plan program-path arguments policy cwd
+                              environment clear-environment-p))
       (t
        (error 'sandbox-unavailable
               :message "No sandbox backend is available for this operating system."

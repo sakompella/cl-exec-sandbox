@@ -11,6 +11,7 @@
                              (:file "conditions")
                              (:file "policy")
                              (:file "linux")
+                             (:file "darwin")
                              (:file "execute"))))
   :in-order-to ((asdf:test-op (asdf:test-op #:cl-exec-sandbox/tests))))
 
