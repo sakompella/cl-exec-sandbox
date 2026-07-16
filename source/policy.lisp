@@ -120,8 +120,8 @@
        (network :isolated)
        (workspace-roots nil)
        glob-scan-maximum-depth
-       (mount-proc-p t)
-       (isolate-processes-p t)
+       (mount-proc-p (not (member :darwin *features*)))
+       (isolate-processes-p (not (member :darwin *features*)))
        (protected-metadata-names '(".git" ".agents" ".codex")))
   "Create a validated general-purpose sandbox policy."
   (unless (member filesystem-kind '(:restricted :unrestricted :external))

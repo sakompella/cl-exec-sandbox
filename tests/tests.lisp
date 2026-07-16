@@ -1,3 +1,6 @@
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
 (in-package #:cl-exec-sandbox/tests)
 
 (defvar *test-count* 0
@@ -48,7 +51,7 @@
          t))
      "glob rules reject positive access")
     (test-assert (getf (sandbox-capabilities) :filesystem-read-write-deny)
-                 "Linux capability discovery finds bubblewrap"))
+                 "the active backend reports filesystem enforcement"))
   nil)
 
 (defun test-bwrap-override ()

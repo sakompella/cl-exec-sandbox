@@ -7,13 +7,14 @@
   "System directories needed by ordinary macOS command interpreters.")
 
 (defun darwin--sbpl-string (value)
-  "Quote VALUE for an SBPL string literal."
-  (with-output-to-string (stream)
-    (write-char #\" stream)
-    (loop for character across (uiop:native-namestring (pathname value)) do
+  "Quote VALUE for an SBPL string literal, canonicalizing existing paths."
+  (let ((path (if (probe-file value) (truename value) (pathname value))))
+    (with-output-to-string (stream)
+      (write-char #\" stream)
+      (loop for character across (uiop:native-namestring path) do
       (when (member character '(#\\ #\")) (write-char #\\ stream))
       (write-char character stream))
-    (write-char #\" stream)))
+      (write-char #\" stream))))
 
 (defun darwin--rule (operation path)
   "Return an SBPL path operation for PATH."
@@ -48,10 +49,14 @@
   (when (sandbox-policy-isolate-processes-p policy)
     (error 'sandbox-unavailable :capability :process-namespaces
            :message "macOS Seatbelt cannot provide Linux user, PID, IPC, and UTS namespaces."))
-  (let ((forms (list "(version 1)" "(deny default)"
-                     "(allow process-fork process-exec process-signal process-info*)"
-                     "(allow sysctl-read mach-lookup)")))
-    (labels ((add (form) (push form forms))
+  (let ((forms nil))
+    (dolist (form '("(allow mach-lookup)"
+                    "(allow sysctl-read)"
+                    "(allow process*)"
+                    "(deny default)"
+                    "(version 1)"))
+      (push form forms))
+    (labels ((add (form) (setf forms (append forms (list form))))
              (path-rule (access path)
                (case access
                  (:read (add (darwin--rule "file-read*" path)))
@@ -69,7 +74,13 @@
                             (linux--absolute-path (filesystem-rule-path rule) cwd)))
           (:special
            (dolist (path (linux--special-paths rule policy cwd))
-             (path-rule (filesystem-rule-access rule) path)))
+             (let ((access (filesystem-rule-access rule)))
+               (path-rule :read path)
+               (when (eq access :write)
+                 (add (darwin--rule "file-write*" path)))
+               (when (eq access :deny)
+                 (add (format nil "(deny file-read* file-write* (subpath ~A))"
+                              (darwin--sbpl-string path)))))))
           (:glob
            (dolist (root (or (sandbox-policy-workspace-roots policy) (list cwd)))
              (add (darwin--glob-rule "file-read*"
@@ -80,13 +91,30 @@
                                         (darwin--glob-regex (filesystem-rule-path rule)))))))))
       (dolist (root (sandbox-policy-workspace-roots policy))
         (dolist (name (sandbox-policy-protected-metadata-names policy))
+          (dolist (operation '("file-write-create" "file-write-data"
+                               "file-write-unlink" "file-write-mode"
+                               "file-write-owner" "file-write-flags"))
+            (add (format nil "(deny ~A (subpath ~A))" operation
+                         (darwin--sbpl-string
+                          (merge-pathnames (format nil "~A/" name) root))))))
+        (when (find-if (lambda (rule)
+                         (and (eq (filesystem-rule-kind rule) :special)
+                              (eq (filesystem-rule-path rule) :workspace-roots)
+                              (eq (filesystem-rule-access rule) :write)))
+                       (sandbox-policy-filesystem-rules policy))
+          (add (darwin--rule "file-read*" root))
+          (dolist (operation '("file-write-create" "file-write-data"
+                               "file-write-unlink" "file-write-mode"
+                               "file-write-owner" "file-write-flags"))
+            (add (darwin--rule operation root))))
+        (dolist (name (sandbox-policy-protected-metadata-names policy))
           (add (format nil "(deny file-write* (subpath ~A))"
                        (darwin--sbpl-string (merge-pathnames (format nil "~A/" name) root))))))
       (unless (eq (sandbox-policy-network policy) :enabled)
         ;; The default deny already blocks network-client and network-outbound.
         (add "(deny network*)"))
       (return-from darwin--profile
-        (format nil "~{~A~%~}" (nreverse forms)))))))
+        (format nil "~{~A~%~}" forms))))))
 
 (defun darwin--seatbelt-plan (program arguments policy cwd environment clear-environment-p)
   "Return a launch plan using the absolute system Seatbelt executable."
