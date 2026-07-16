@@ -426,6 +426,31 @@
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))
   nil)
 
+(defun test-sandbox-environment-and-cleanup ()
+  "Test sandbox environment replacement and Seatbelt profile cleanup."
+  (when (tests--darwin-p)
+    (labels ((profile-names ()
+               (sort
+                (mapcar #'uiop:native-namestring
+                        (directory
+                         (merge-pathnames
+                          "cl-exec-sandbox-seatbelt-*.sb"
+                          (uiop:temporary-directory))))
+                #'string<)))
+      (let ((before (profile-names))
+            (result
+              (run-sandboxed
+               "/bin/sh"
+               '("-c" "printf %s \"$VALUE\"")
+               :policy (read-only-sandbox-policy)
+               :environment '("VALUE=present")
+               :clear-environment-p t)))
+        (test-assert (string= (sandbox-result-output result) "present")
+                     "sandbox execution receives its explicit environment")
+        (test-assert (equal before (profile-names))
+                     "Seatbelt profile files are removed after execution"))))
+  nil)
+
 (defun test-timeout ()
   "Test deadline supervision terminates a sandbox process."
   (let ((result
@@ -550,6 +575,7 @@
   (test-enabled-network)
   (test-unrestricted-filesystem-with-isolated-network)
   (test-external-execution-context)
+  (test-sandbox-environment-and-cleanup)
   (test-timeout)
   (test-merged-output)
   (test-isolated-network-seccomp)
