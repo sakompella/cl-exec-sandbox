@@ -7,6 +7,75 @@
     #P"/private/")
   "System directories needed by ordinary macOS command interpreters.")
 
+(defparameter +darwin-base-sysctl-form+
+  "(allow sysctl-read
+  (sysctl-name \"hw.activecpu\")
+  (sysctl-name \"hw.busfrequency_compat\")
+  (sysctl-name \"hw.byteorder\")
+  (sysctl-name \"hw.cacheconfig\")
+  (sysctl-name \"hw.cachelinesize_compat\")
+  (sysctl-name \"hw.cpufamily\")
+  (sysctl-name \"hw.cpufrequency_compat\")
+  (sysctl-name \"hw.cputype\")
+  (sysctl-name \"hw.l1dcachesize_compat\")
+  (sysctl-name \"hw.l1icachesize_compat\")
+  (sysctl-name \"hw.l2cachesize_compat\")
+  (sysctl-name \"hw.l3cachesize_compat\")
+  (sysctl-name \"hw.logicalcpu_max\")
+  (sysctl-name \"hw.machine\")
+  (sysctl-name \"hw.model\")
+  (sysctl-name \"hw.memsize\")
+  (sysctl-name \"hw.ncpu\")
+  (sysctl-name \"hw.nperflevels\")
+  (sysctl-name-prefix \"hw.optional.arm.\")
+  (sysctl-name-prefix \"hw.optional.armv8_\")
+  (sysctl-name \"hw.packages\")
+  (sysctl-name \"hw.pagesize_compat\")
+  (sysctl-name \"hw.pagesize\")
+  (sysctl-name \"hw.physicalcpu\")
+  (sysctl-name \"hw.physicalcpu_max\")
+  (sysctl-name \"hw.logicalcpu\")
+  (sysctl-name \"hw.cpufrequency\")
+  (sysctl-name \"hw.tbfrequency_compat\")
+  (sysctl-name \"hw.vectorunit\")
+  (sysctl-name \"machdep.cpu.brand_string\")
+  (sysctl-name \"kern.argmax\")
+  (sysctl-name \"kern.hostname\")
+  (sysctl-name \"kern.maxfilesperproc\")
+  (sysctl-name \"kern.maxproc\")
+  (sysctl-name \"kern.osproductversion\")
+  (sysctl-name \"kern.osrelease\")
+  (sysctl-name \"kern.ostype\")
+  (sysctl-name \"kern.osvariant_status\")
+  (sysctl-name \"kern.osversion\")
+  (sysctl-name \"kern.secure_kernel\")
+  (sysctl-name \"kern.usrstack64\")
+  (sysctl-name \"kern.version\")
+  (sysctl-name \"sysctl.proc_cputype\")
+  (sysctl-name \"vm.loadavg\")
+  (sysctl-name-prefix \"hw.perflevel\")
+  (sysctl-name-prefix \"kern.proc.pgrp.\")
+  (sysctl-name-prefix \"kern.proc.pid.\")
+  (sysctl-name-prefix \"net.routetable.\"))"
+  "The enumerated sysctls used by ordinary command runtimes.")
+
+(defparameter +darwin-base-mach-lookup-form+
+  "(allow mach-lookup
+  (global-name \"com.apple.system.opendirectoryd.libinfo\"))")
+
+(defun darwin--base-policy-forms ()
+  "Return the narrow Seatbelt permissions needed before filesystem rules."
+  (list "(allow process-exec)"
+        "(allow process-fork)"
+        "(allow signal (target same-sandbox))"
+        "(allow process-info* (target same-sandbox))"
+        "(allow file-write-data
+  (require-all
+    (path \"/dev/null\")
+    (vnode-type CHARACTER-DEVICE)))"
+        +darwin-base-sysctl-form+
+        +darwin-base-mach-lookup-form+))
+
 (defun darwin--seatbelt-executable ()
   "Return the trusted system Seatbelt executable, or NIL."
   (when (and (probe-file #P"/usr/bin/sandbox-exec")
@@ -152,7 +221,9 @@ components, and character classes are retained."
                (slash (position #\/ static :from-end t)))
           (if (null slash)
               pattern
-              (let* ((directory (subseq static 0 slash))
+              (let* ((directory (if (zerop slash)
+                                    "/"
+                                    (subseq static 0 slash)))
                      (suffix (subseq pattern slash))
                      (canonical (uiop:native-namestring
                                  (darwin--normalize-path directory))))
@@ -162,12 +233,17 @@ components, and character classes are retained."
 
 (defun darwin--glob-regex (pattern root)
   "Translate PATTERN below ROOT into an anchored Seatbelt regex."
+  (unless (stringp pattern)
+    (error 'sandbox-policy-error
+           :message "A Darwin deny-glob pattern must remain a string."))
   (let* ((root (uiop:native-namestring (darwin--normalize-path root)))
          (absolute (uiop:absolute-pathname-p (pathname pattern)))
+         ;; Keep wildcard syntax as text.  Passing a wildcard pathname to
+         ;; NATIVE-NAMESTRING signals NO-NATIVE-NAMESTRING-ERROR on SBCL.
+         (pattern-string pattern)
          (raw (if absolute
-                  (darwin--canonicalize-glob-prefix
-                   (uiop:native-namestring (pathname pattern)))
-                  pattern)))
+                  (darwin--canonicalize-glob-prefix pattern-string)
+                  pattern-string)))
     (multiple-value-bind (body saw-glob)
         (darwin--glob-body raw)
       (let ((prefix (if absolute
@@ -220,29 +296,34 @@ components, and character classes are retained."
             (or (uiop:getenv "TMPDIR") (uiop:temporary-directory)) cwd)))
     (:slash-tmp (list #P"/tmp/"))))
 
-(defun darwin--resolve-rules (policy cwd)
-  "Resolve POLICY's literal, special, and deny-glob rules for Darwin."
-  (loop for rule in (sandbox-policy-filesystem-rules policy)
-        append
-        (case (filesystem-rule-kind rule)
-          (:path
-           (list (darwin--make-resolved-rule
-                  (darwin--subpath-matcher
-                   (linux--absolute-path (filesystem-rule-path rule) cwd))
-                  (filesystem-rule-access rule))))
-          (:special
-           (loop for path in (darwin--special-paths rule policy cwd)
-                 collect (darwin--make-resolved-rule
-                          (darwin--subpath-matcher path)
-                          (filesystem-rule-access rule))))
-          (:glob
-           (loop for root in (or (sandbox-policy-workspace-roots policy)
-                                 (list cwd))
-                 collect (darwin--make-resolved-rule
-                          (darwin--regex-matcher
-                           (darwin--glob-regex
-                            (filesystem-rule-path rule) root))
-                          :deny))))))
+(defun darwin--resolve-rules (policy cwd &optional excluded-paths)
+  "Resolve POLICY's rules and optional internal excluded paths for Darwin."
+  (append
+   (loop for rule in (sandbox-policy-filesystem-rules policy)
+         append
+         (case (filesystem-rule-kind rule)
+           (:path
+            (list (darwin--make-resolved-rule
+                   (darwin--subpath-matcher
+                    (linux--absolute-path (filesystem-rule-path rule) cwd))
+                   (filesystem-rule-access rule))))
+           (:special
+            (loop for path in (darwin--special-paths rule policy cwd)
+                  collect (darwin--make-resolved-rule
+                           (darwin--subpath-matcher path)
+                           (filesystem-rule-access rule))))
+           (:glob
+            (loop for root in (or (sandbox-policy-workspace-roots policy)
+                                  (list cwd))
+                  collect (darwin--make-resolved-rule
+                           (darwin--regex-matcher
+                            (darwin--glob-regex
+                             (filesystem-rule-path rule) root))
+                           :deny)))))
+   (loop for path in excluded-paths
+         collect (darwin--make-resolved-rule
+                  (darwin--subpath-matcher path)
+                  :deny))))
 
 (defun darwin--access-grants (access operation)
   "Return whether ACCESS grants the requested file OPERATION."
@@ -326,7 +407,7 @@ positive rule gets its own allow and can reopen a denied parent."
               (if (eq operation :read) "file-read*" "file-write*")
               (nreverse components)))))
 
-(defun darwin--profile (policy cwd)
+(defun darwin--profile (policy cwd &optional excluded-paths)
   "Build an SBPL profile for POLICY, or reject an unrepresentable guarantee."
   (when (eq (sandbox-policy-network policy) :proxy-only)
     (error 'sandbox-unavailable :capability :network-proxy-only
@@ -337,7 +418,7 @@ positive rule gets its own allow and can reopen a denied parent."
   (when (sandbox-policy-isolate-processes-p policy)
     (error 'sandbox-unavailable :capability :process-namespaces
            :message "macOS Seatbelt cannot provide Linux user, PID, IPC, and UTS namespaces."))
-  (let* ((rules (darwin--resolve-rules policy cwd))
+  (let* ((rules (darwin--resolve-rules policy cwd excluded-paths))
          (implicit-rules
            (append
             (when (eq (sandbox-policy-filesystem-kind policy) :unrestricted)
@@ -369,16 +450,42 @@ positive rule gets its own allow and can reopen a denied parent."
                                      (darwin--resolved-rule-access rule) :write))
                                   rules)
                                  protected-regexes))
-         (forms (list "(version 1)"
-                      "(deny default)"
-                      "(allow process*)"
-                      "(allow sysctl-read)"
-                      "(allow mach-lookup)")))
+         (forms (append (list "(version 1)"
+                              "(deny default)")
+                        (darwin--base-policy-forms))))
     (when read-policy (setf forms (append forms (list read-policy))))
     (when write-policy (setf forms (append forms (list write-policy))))
     (when (eq (sandbox-policy-network policy) :enabled)
       (setf forms (append forms (list "(allow network*)"))))
     (format nil "~{~A~%~}" forms)))
+
+(defun darwin--private-profile-directory ()
+  "Create a private mode-0700 directory for one transient Seatbelt profile."
+  (loop
+    for candidate =
+      (merge-pathnames
+       (format nil ".cl-exec-sandbox-seatbelt-~36R-~36R/"
+               (get-universal-time) (random most-positive-fixnum))
+       (user-homedir-pathname))
+    unless (probe-file candidate)
+      do (multiple-value-bind (output error-output status)
+             (uiop:run-program
+              (list "/bin/mkdir" "-m" "700" (uiop:native-namestring candidate))
+              :output :string
+              :error-output :string
+              :ignore-error-status t)
+           (declare (ignore output))
+           (cond
+             ((zerop status)
+              (return candidate))
+             ((probe-file candidate)
+              nil)
+             (t
+              (error 'sandbox-unavailable
+                     :capability :seatbelt
+                     :message
+                     (format nil "Could not create a private Seatbelt profile directory: ~A"
+                             error-output)))))))
 
 (defun darwin--seatbelt-plan
     (program arguments policy cwd environment clear-environment-p)
@@ -386,19 +493,22 @@ positive rule gets its own allow and can reopen a denied parent."
   (unless (darwin--seatbelt-executable)
     (error 'sandbox-unavailable :capability :seatbelt
            :message "The trusted /usr/bin/sandbox-exec executable is unavailable."))
-  ;; Build the profile before creating its temporary file so unsupported policy
-  ;; requests do not leave cleanup obligations behind.
-  (let ((profile-text (darwin--profile policy cwd))
-        (profile
-          (merge-pathnames
-           (format nil "cl-exec-sandbox-seatbelt-~36R.sb"
-                   (random most-positive-fixnum))
-           (uiop:temporary-directory))))
+  ;; Build the profile before creating its file so unsupported policy requests
+  ;; do not leave cleanup obligations behind.  The profile directory is outside
+  ;; the default writable roots and is denied explicitly in the generated policy.
+  (let ((profile-directory (darwin--private-profile-directory))
+        (profile nil))
     (handler-case
         (progn
-          (with-open-file (stream profile :direction :output :if-exists :error
-                                  :if-does-not-exist :create)
-            (write-string profile-text stream))
+          (setf profile
+                (merge-pathnames
+                 (format nil "profile-~36R.sb" (random most-positive-fixnum))
+                 profile-directory))
+          (let ((profile-text
+                  (darwin--profile policy cwd (list profile-directory))))
+            (with-open-file (stream profile :direction :output :if-exists :error
+                                    :if-does-not-exist :create)
+              (write-string profile-text stream)))
           (make-instance 'sandbox-plan
                          :program #P"/usr/bin/sandbox-exec"
                          :arguments (append
@@ -409,9 +519,13 @@ positive rule gets its own allow and can reopen a denied parent."
                          :environment-provided-p
                          (or environment clear-environment-p)
                          :working-directory cwd
-                         :cleanup-paths (list profile)))
+                         :cleanup-paths (list profile-directory profile)))
       (error (condition)
         (execute--safe-delete profile)
-        (error 'sandbox-unavailable :capability :seatbelt
-               :message (format nil "Could not construct a macOS Seatbelt profile: ~A"
-                                 condition))))))
+        (execute--safe-delete profile-directory)
+        (if (typep condition 'sandbox-unavailable)
+            (error condition)
+            (error 'sandbox-unavailable :capability :seatbelt
+                   :message
+                   (format nil "Could not construct a macOS Seatbelt profile: ~A"
+                           condition)))))))

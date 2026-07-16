@@ -60,7 +60,11 @@
       (test-assert (not (sandbox-supported-p :network-proxy-only))
                    "Darwin reports proxy-only networking as unsupported")
       (test-assert (eq (getf (sandbox-capabilities) :backend) :seatbelt)
-                   "Darwin reports the Seatbelt backend")))
+                   "Darwin reports the Seatbelt backend")
+      (test-assert
+       (eq (not (null (getf (sandbox-capabilities) :available-p)))
+           (not (null (cl-exec-sandbox::darwin--seatbelt-executable))))
+       "Darwin capability discovery uses Seatbelt executable validation")))
   nil)
 
 (defun test-darwin-profile-filters ()
@@ -90,6 +94,24 @@
                           "Seatbelt protects metadata with a regex")
              (test-assert (not (search "(deny file-write" profile))
                           "Seatbelt does not rely on later write denies")
+             (test-assert (search "(allow process-exec)" profile)
+                          "Seatbelt permits only executable child processes")
+             (test-assert (search "(allow process-fork)" profile)
+                          "Seatbelt permits child process creation")
+             (test-assert (search "(allow signal (target same-sandbox))" profile)
+                          "Seatbelt limits signals to same-sandbox processes")
+             (test-assert (search "(allow process-info* (target same-sandbox))" profile)
+                          "Seatbelt limits process information to same-sandbox processes")
+             (test-assert (not (search "(allow process*)" profile))
+                          "Seatbelt omits the broad process permission")
+             (test-assert (not (search "(allow sysctl-read)" profile))
+                          "Seatbelt omits unfiltered sysctl reads")
+             (test-assert (not (search "(allow mach-lookup)" profile))
+                          "Seatbelt omits unfiltered Mach service lookup")
+             (test-assert (search "(sysctl-name \"hw.ncpu\")" profile)
+                          "Seatbelt enumerates required sysctl names")
+             (test-assert (search "com.apple.system.opendirectoryd.libinfo" profile)
+                          "Seatbelt names the required directory-service lookup")
         (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
   nil))
 
@@ -291,6 +313,9 @@
   (let* ((root (tests--temporary-root))
          (secret (tests--write (merge-pathnames "private.key" root) "secret"))
          (public (tests--write (merge-pathnames "public.txt" root) "public"))
+         (pattern (if (tests--darwin-p)
+                      (concatenate 'string (uiop:native-namestring root) "*.key")
+                      "*.key"))
          (policy
            (make-sandbox-policy
             :workspace-roots (list root)
@@ -300,7 +325,7 @@
             (list
              (make-filesystem-rule :kind :special :path :root :access :read)
              (make-filesystem-rule :kind :path :path root :access :write)
-             (make-filesystem-rule :kind :glob :path "*.key" :access :deny)))))
+             (make-filesystem-rule :kind :glob :path pattern :access :deny)))))
     (unwind-protect
          (let ((result
                  (run-sandboxed
@@ -316,6 +341,26 @@
            (test-assert (string= (sandbox-result-output result) "public")
                         "deny glob hides only matching content"))
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))
+  nil)
+
+(defun test-darwin-absolute-deny-glob-translation ()
+  "Test absolute Darwin globs canonicalize only their static prefix."
+  (when (tests--darwin-p)
+    (let* ((root (tests--temporary-root))
+           (pattern (concatenate 'string
+                                 (uiop:native-namestring root)
+                                 "*.key"))
+           (regex (cl-exec-sandbox::darwin--glob-regex pattern root)))
+      (unwind-protect
+           (progn
+             (test-assert (search (string-right-trim
+                                   "/"
+                                   (uiop:native-namestring (truename root)))
+                                  regex)
+                          "absolute Darwin globs retain their canonical prefix")
+             (test-assert (search "[^/]*\\.key" regex)
+                          "absolute Darwin globs retain wildcard syntax as regex text"))
+        (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
   nil)
 
 (defun test-direct-full-access ()
@@ -427,28 +472,56 @@
   nil)
 
 (defun test-sandbox-environment-and-cleanup ()
-  "Test sandbox environment replacement and Seatbelt profile cleanup."
+  "Test sandbox environment replacement and private Seatbelt profile cleanup."
   (when (tests--darwin-p)
     (labels ((profile-names ()
                (sort
                 (mapcar #'uiop:native-namestring
                         (directory
                          (merge-pathnames
-                          "cl-exec-sandbox-seatbelt-*.sb"
-                          (uiop:temporary-directory))))
+                          ".cl-exec-sandbox-seatbelt-*/*.sb"
+                          (user-homedir-pathname))))
                 #'string<)))
-      (let ((before (profile-names))
-            (result
-              (run-sandboxed
-               "/bin/sh"
-               '("-c" "printf %s \"$VALUE\"")
-               :policy (read-only-sandbox-policy)
-               :environment '("VALUE=present")
-               :clear-environment-p t)))
-        (test-assert (string= (sandbox-result-output result) "present")
-                     "sandbox execution receives its explicit environment")
-        (test-assert (equal before (profile-names))
-                     "Seatbelt profile files are removed after execution"))))
+      (let ((before (profile-names)))
+        (let ((plan
+                (sandbox-build-plan "/bin/true" nil
+                                    :policy (read-only-sandbox-policy))))
+          (unwind-protect
+               (let* ((paths (sandbox-plan-cleanup-paths plan))
+                      (profile (find-if
+                                (lambda (path)
+                                  (search ".sb"
+                                          (uiop:native-namestring path)))
+                                paths))
+                      (directory (uiop:pathname-directory-pathname profile)))
+                 (test-assert profile
+                              "Seatbelt plans retain the transient profile path")
+                 (test-assert
+                  (not (cl-exec-sandbox::linux--path-under-p
+                        profile (uiop:temporary-directory)))
+                  "Seatbelt profiles stay outside the default temporary root")
+                 (test-assert
+                  (= (logand (sb-posix:stat-mode (sb-posix:stat directory)) #o777)
+                     #o700)
+                  "Seatbelt profile directories are private")
+                 (dolist (path (reverse paths))
+                   (cl-exec-sandbox::execute--safe-delete path))
+                 (test-assert (every (lambda (path) (not (probe-file path)))
+                                     paths)
+                              "Seatbelt cleanup removes the profile and private directory"))
+            (dolist (path (reverse (sandbox-plan-cleanup-paths plan)))
+              (cl-exec-sandbox::execute--safe-delete path))))
+        (let ((result
+                (run-sandboxed
+                 "/bin/sh"
+                 '("-c" "printf %s \"$VALUE\"")
+                 :policy (read-only-sandbox-policy)
+                 :environment '("VALUE=present")
+                 :clear-environment-p t)))
+          (test-assert (string= (sandbox-result-output result) "present")
+                       "sandbox execution receives its explicit environment")
+          (test-assert (equal before (profile-names))
+                       "Seatbelt profile files and directories are removed after execution")))))
   nil)
 
 (defun test-timeout ()
@@ -570,6 +643,7 @@
   (test-deny-and-nested-override)
   (test-quoted-workspace-path)
   (test-deny-glob)
+  (test-darwin-absolute-deny-glob-translation)
   (test-direct-full-access)
   (test-network-profile-modes)
   (test-enabled-network)
