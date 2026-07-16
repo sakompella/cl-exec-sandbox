@@ -14,9 +14,12 @@ Lisp. Its Linux policy model provides:
 - child timeouts and captured output;
 - explicit capability discovery and fail-closed unsupported-policy errors.
 
-The first backend targets Linux x86-64 and SBCL. It uses the system =bwrap=
+The Linux backend targets Linux x86-64 and SBCL. It uses the system =bwrap=
 binary for filesystem and namespace isolation, plus a private helper for
-=no_new_privs=, seccomp, and managed proxy routing. The helper is not installed
+=no_new_privs=, seccomp, and managed proxy routing. The macOS backend uses the
+trusted =/usr/bin/sandbox-exec= Seatbelt executable for filtered filesystem and
+network policies; Linux-only process namespaces and managed proxy-only
+networking are reported as unsupported on macOS. The helper is not installed
 on =PATH=. The library never silently runs a restricted policy without the
 required backend.
 
@@ -40,7 +43,8 @@ not a dependency.
 
 * Checks
 
-Build the private Linux helper and run the complete test suite:
+Build the private Linux helper on Linux, or use the available SBCL on macOS,
+and run the complete test suite:
 
 #+BEGIN_SRC sh
 ./check
