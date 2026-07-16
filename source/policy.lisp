@@ -120,10 +120,14 @@
        (network :isolated)
        (workspace-roots nil)
        glob-scan-maximum-depth
-       (mount-proc-p (not (member :darwin *features*)))
-       (isolate-processes-p (not (member :darwin *features*)))
+       (mount-proc-p t)
+       (isolate-processes-p t)
        (protected-metadata-names '(".git" ".agents" ".codex")))
-  "Create a validated general-purpose sandbox policy."
+  "Create a validated general-purpose sandbox policy.
+
+The defaults describe the Linux process-isolation contract and are independent
+of the host Lisp image.  Platform presets select compatible backend options
+explicitly below."
   (unless (member filesystem-kind '(:restricted :unrestricted :external))
     (error 'sandbox-policy-error
            :message "FILESYSTEM-KIND must be :RESTRICTED, :UNRESTRICTED, or :EXTERNAL."))
@@ -172,12 +176,20 @@
   "Return one literal PATH rule granting ACCESS."
   (make-filesystem-rule :kind :path :path path :access access))
 
+(defun policy--preset-process-options ()
+  "Return explicit process options supported by the native preset backend."
+  (if (member :darwin *features*)
+      '(:mount-proc-p nil :isolate-processes-p nil)
+      '(:mount-proc-p t :isolate-processes-p t)))
+
 (defun read-only-sandbox-policy (&key (network :isolated) workspace-roots)
   "Return a whole-filesystem read-only policy."
-  (make-sandbox-policy
-   :network network
-   :workspace-roots workspace-roots
-   :filesystem-rules (list (policy--special-rule :root :read))))
+  (apply #'make-sandbox-policy
+         (append (policy--preset-process-options)
+                 (list :network network
+                       :workspace-roots workspace-roots
+                       :filesystem-rules
+                       (list (policy--special-rule :root :read))))))
 
 (defun workspace-write-sandbox-policy
     (&key
@@ -196,20 +208,25 @@
       (setf rules (append rules (list (policy--special-rule :slash-tmp :write)))))
     (when write-tmpdir-p
       (setf rules (append rules (list (policy--special-rule :tmpdir :write)))))
-    (make-sandbox-policy
-     :network network
-     :workspace-roots workspace-roots
-     :protected-metadata-names protected-metadata-names
-     :filesystem-rules rules)))
+    (apply #'make-sandbox-policy
+           (append (policy--preset-process-options)
+                   (list :network network
+                         :workspace-roots workspace-roots
+                         :protected-metadata-names protected-metadata-names
+                         :filesystem-rules rules)))))
 
 (defun unrestricted-sandbox-policy (&key (network :enabled))
   "Return a policy granting full filesystem and selected network access."
-  (make-sandbox-policy :filesystem-kind :unrestricted
+  (apply #'make-sandbox-policy
+         (append (policy--preset-process-options)
+                 (list :filesystem-kind :unrestricted
                        :network network
-                       :isolate-processes-p nil))
+                       :isolate-processes-p nil))))
 
 (defun external-sandbox-policy (&key (network :enabled))
   "Return a policy declaring that containment is supplied outside this library."
-  (make-sandbox-policy :filesystem-kind :external
+  (apply #'make-sandbox-policy
+         (append (policy--preset-process-options)
+                 (list :filesystem-kind :external
                        :network network
-                       :isolate-processes-p nil))
+                       :isolate-processes-p nil))))
