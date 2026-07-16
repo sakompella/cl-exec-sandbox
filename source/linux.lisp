@@ -89,22 +89,22 @@
 
 (defun sandbox-capabilities ()
   "Return a portable plist describing the current host sandbox backend."
-  (let ((linux-p (member :linux *features*))
+  (let* ((linux-p (member :linux *features*))
         (darwin-p (member :darwin *features*))
+        (seatbelt (and darwin-p (probe-file #P"/usr/bin/sandbox-exec")))
         (bwrap (and (member :linux *features*) (linux--find-bwrap)))
         (rg (and (member :linux *features*) (linux--find-rg)))
         (helper (and (member :linux *features*) (linux--find-helper))))
     (list :platform (cond (linux-p :linux) (darwin-p :macos)
                           ((member :windows *features*) :windows) (t :unknown))
-          :backend (cond (bwrap :bubblewrap) (darwin-p :seatbelt))
-          :available-p (or (not (null bwrap))
-                           (and darwin-p (probe-file #P"/usr/bin/sandbox-exec")))
-          :filesystem-read-write-deny (or bwrap darwin-p)
-          :filesystem-deny-globs (or (and bwrap rg) darwin-p)
-          :nested-overrides (or bwrap darwin-p)
+          :backend (cond (bwrap :bubblewrap) (seatbelt :seatbelt))
+          :available-p (or bwrap seatbelt)
+          :filesystem-read-write-deny (or bwrap seatbelt)
+          :filesystem-deny-globs (or (and bwrap rg) seatbelt)
+          :nested-overrides (or bwrap seatbelt)
           :process-namespaces (not (null bwrap))
           :network-enabled t
-          :network-isolated (or (and bwrap helper) darwin-p)
+          :network-isolated (or (and bwrap helper) seatbelt)
           :network-proxy-only (and bwrap helper)
           :seccomp (not (null helper)))))
 
@@ -582,6 +582,7 @@
                       :working-directory cwd
                       :cleanup-paths nil))
       ((and (eq (sandbox-policy-filesystem-kind policy) :unrestricted)
+            (null (sandbox-policy-filesystem-rules policy))
             (eq (sandbox-policy-network policy) :enabled))
        (make-instance 'sandbox-plan
                       :program program-path
