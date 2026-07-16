@@ -4,9 +4,20 @@ set -euo pipefail
 
 source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-"$source_root/scripts/build-helper"
+if [[ "$(uname -s)" == "Linux" ]]; then
+  "$source_root/scripts/build-helper"
+fi
 
-exec sbcl --noinform --non-interactive \
+if command -v sbcl >/dev/null 2>&1; then
+  sbcl_command=(sbcl)
+elif command -v nix >/dev/null 2>&1; then
+  sbcl_command=(nix run nixpkgs#sbcl --)
+else
+  printf '%s\n' 'check: SBCL or Nix is required.' >&2
+  exit 1
+fi
+
+exec "${sbcl_command[@]}" --noinform --non-interactive \
   --eval '(require :asdf)' \
   --eval "(push #P\"$source_root/\" asdf:*central-registry*)" \
   --eval '(asdf:test-system :cl-exec-sandbox)'
