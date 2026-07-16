@@ -91,7 +91,7 @@
   "Return a portable plist describing the current host sandbox backend."
   (let* ((linux-p (member :linux *features*))
         (darwin-p (member :darwin *features*))
-        (seatbelt (and darwin-p (probe-file #P"/usr/bin/sandbox-exec")))
+        (seatbelt (and darwin-p (darwin--seatbelt-executable)))
         (bwrap (and (member :linux *features*) (linux--find-bwrap)))
         (rg (and (member :linux *features*) (linux--find-rg)))
         (helper (and (member :linux *features*) (linux--find-helper))))
